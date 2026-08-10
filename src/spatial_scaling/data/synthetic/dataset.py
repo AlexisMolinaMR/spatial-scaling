@@ -81,7 +81,9 @@ class SyntheticExpressionDataset(Dataset[dict[str, Any]]):
         ]
         if missing:
             raise FileNotFoundError(f"missing section shards: {missing[:3]}")
-        self._cache: OrderedDict[str, tuple[np.ndarray, np.ndarray]] = OrderedDict()
+        self._cache: OrderedDict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = (
+            OrderedDict()
+        )
         self._validate_shard(self.section_ids[0])
 
     def _load_metadata(self) -> dict[str, Any]:
@@ -144,7 +146,7 @@ class SyntheticExpressionDataset(Dataset[dict[str, Any]]):
         return value
 
     def _validate_shard(self, section_id: str) -> None:
-        expression, cell_ids = self._load_shard(section_id)
+        expression, cell_ids, coordinates = self._load_shard(section_id)
         if expression.shape != (self.cells_per_section, self.num_genes):
             raise ValueError(
                 f"invalid expression shape for {section_id}: {expression.shape}"
@@ -153,15 +155,26 @@ class SyntheticExpressionDataset(Dataset[dict[str, Any]]):
             raise ValueError(
                 f"invalid cell_id shape for {section_id}: {cell_ids.shape}"
             )
+        if coordinates.shape != (self.cells_per_section, 2):
+            raise ValueError(
+                f"invalid coordinate shape for {section_id}: {coordinates.shape}"
+            )
 
-    def _load_shard(self, section_id: str) -> tuple[np.ndarray, np.ndarray]:
+    def _load_shard(self, section_id: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         cached = self._cache.get(section_id)
         if cached is not None:
             self._cache.move_to_end(section_id)
             return cached
         path = self._shard_paths[section_id]
         with np.load(path, allow_pickle=False) as data:
-            required = {"expression", "cell_id", "section_id", "split"}
+            required = {
+                "expression",
+                "cell_id",
+                "section_id",
+                "split",
+                "x_um",
+                "y_um",
+            }
             if not required.issubset(data.files):
                 raise ValueError(f"section shard lacks required arrays: {path}")
             stored_sections = data["section_id"]
@@ -172,9 +185,13 @@ class SyntheticExpressionDataset(Dataset[dict[str, Any]]):
                 raise ValueError(f"split mismatch in shard: {path}")
             expression = data["expression"].astype(np.float32, copy=True)
             cell_ids = data["cell_id"].astype(str, copy=True)
+            coordinates = np.column_stack((data["x_um"], data["y_um"])).astype(
+                np.float32, copy=False
+            )
         expression.flags.writeable = False
         cell_ids.flags.writeable = False
-        value = (expression, cell_ids)
+        coordinates.flags.writeable = False
+        value = (expression, cell_ids, coordinates)
         self._cache[section_id] = value
         while len(self._cache) > self.cache_sections:
             self._cache.popitem(last=False)
@@ -192,7 +209,7 @@ class SyntheticExpressionDataset(Dataset[dict[str, Any]]):
             raise IndexError(index)
         section_offset, cell_offset = divmod(index, self.cells_per_section)
         section_id = self.section_ids[section_offset]
-        expression, cell_ids = self._load_shard(section_id)
+        expression, cell_ids, _ = self._load_shard(section_id)
         return {
             "expression": expression[cell_offset],
             "cell_id": str(cell_ids[cell_offset]),
@@ -211,8 +228,23 @@ class SyntheticExpressionDataset(Dataset[dict[str, Any]]):
             raise TypeError("cell_offsets must be a one-dimensional integer array")
         if np.any(offsets < 0) or np.any(offsets >= self.cells_per_section):
             raise IndexError("cell offset is outside its section")
-        expression, cell_ids = self._load_shard(self.section_ids[section_offset])
+        expression, cell_ids, _ = self._load_shard(self.section_ids[section_offset])
         return expression[offsets].copy(), tuple(cell_ids[offsets].tolist())
+
+    def spatial_section(
+        self, section_offset: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Read model-safe expression, coordinates, and IDs for one section.
+
+        Generator latent states, expression decompositions, gene classes, and
+        split labels are deliberately not returned through this interface.
+        """
+        if not 0 <= section_offset < len(self.section_ids):
+            raise IndexError(section_offset)
+        expression, cell_ids, coordinates = self._load_shard(
+            self.section_ids[section_offset]
+        )
+        return expression, coordinates, cell_ids
 
     def deterministic_indices(self, count: int | None, seed: int) -> np.ndarray:
         """Choose a fixed observation subset without changing split membership."""
