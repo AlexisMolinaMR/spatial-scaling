@@ -1,0 +1,31 @@
+experiment_name: pilot_ssl_random_030
+output_dir: results/pilot_ssl/calibration/random_030
+seed: 123
+device: cuda
+data:
+  corpus_path: outputs/pilot_v0_synthetic_spatial
+  cache_sections: 2
+model:
+  hidden_dims: [128, 128]
+  activation: gelu
+  dropout: 0.0
+masking:
+  policy: random
+  fraction: 0.30
+  seed: 123
+  mask_value: 0.0
+optimizer:
+  name: adamw
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+training:
+  batch_size: 1024
+  steps: 2000
+  evaluation_interval: 250
+  mask_epoch_steps: 250
+evaluation:
+  split: validation
+  batch_size: 4096
+  max_cells: 65536
+  observation_seed: 991
+  masking_seed: 992
