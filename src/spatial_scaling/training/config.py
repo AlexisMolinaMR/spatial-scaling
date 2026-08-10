@@ -1,4 +1,4 @@
-"""Explicit configuration schema for Pilot v0 focal-cell SSL."""
+"""Explicit configuration schema for Pilot v0 masked-expression SSL."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from typing import Any
 import yaml
 
 from spatial_scaling.models.cell_encoder import CellMLPConfig
+from spatial_scaling.models.spatial_transformer import SpatialTransformerConfig
 from spatial_scaling.training.masking import MaskingConfig
 
 
@@ -16,6 +17,12 @@ from spatial_scaling.training.masking import MaskingConfig
 class DataConfig:
     corpus_path: str = "outputs/pilot_v0_synthetic_spatial"
     cache_sections: int = 2
+
+
+@dataclass(frozen=True)
+class ContextConfig:
+    context_size: int = 256
+    shuffle_seed: int = 123
 
 
 @dataclass(frozen=True)
@@ -48,7 +55,9 @@ class SSLExperimentConfig:
     output_dir: str = "outputs/pilot_ssl/run"
     seed: int = 123
     device: str = "auto"
+    condition: str = "focal"
     data: DataConfig = field(default_factory=DataConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
     model: dict[str, Any] = field(
         default_factory=lambda: {
             "hidden_dims": [128, 128],
@@ -68,8 +77,20 @@ class SSLExperimentConfig:
             raise TypeError("seed must be an integer")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be 'auto', 'cpu', or 'cuda'")
+        if self.condition not in {"focal", "spatial", "shuffled"}:
+            raise ValueError("condition must be 'focal', 'spatial', or 'shuffled'")
         if self.data.cache_sections < 1:
             raise ValueError("data.cache_sections must be at least 1")
+        if (
+            not isinstance(self.context.context_size, int)
+            or isinstance(self.context.context_size, bool)
+            or self.context.context_size <= 0
+        ):
+            raise ValueError("context.context_size must be a positive integer")
+        if not isinstance(self.context.shuffle_seed, int) or isinstance(
+            self.context.shuffle_seed, bool
+        ):
+            raise TypeError("context.shuffle_seed must be an integer")
         if self.optimizer.name != "adamw":
             raise ValueError("optimizer.name must be 'adamw'")
         if self.optimizer.learning_rate <= 0:
@@ -93,12 +114,29 @@ class SSLExperimentConfig:
         if self.evaluation.max_cells is not None and self.evaluation.max_cells <= 0:
             raise ValueError("evaluation.max_cells must be positive or null")
         self.masking.validate()
-        unknown_model = set(self.model) - {"hidden_dims", "activation", "dropout"}
+        if self.condition == "focal":
+            allowed_model = {"hidden_dims", "activation", "dropout"}
+        else:
+            allowed_model = {
+                "context_size",
+                "embedding_dim",
+                "num_layers",
+                "num_heads",
+                "ffn_width",
+                "dropout",
+                "coordinate_scale_um",
+            }
+        unknown_model = set(self.model) - allowed_model
         if unknown_model:
             raise ValueError(
                 f"unknown model configuration keys: {sorted(unknown_model)}"
             )
-        CellMLPConfig(num_genes=2, **self._normalized_model()).validate()
+        model_config = self.model_config(num_genes=2)
+        model_config.validate()
+        if self.condition != "focal" and (
+            model_config.context_size != self.context.context_size
+        ):
+            raise ValueError("model.context_size must equal context.context_size")
 
     def _normalized_model(self) -> dict[str, Any]:
         values = dict(self.model)
@@ -106,8 +144,11 @@ class SSLExperimentConfig:
             values["hidden_dims"] = tuple(values["hidden_dims"])
         return values
 
-    def model_config(self, num_genes: int) -> CellMLPConfig:
-        return CellMLPConfig(num_genes=num_genes, **self._normalized_model())
+    def model_config(self, num_genes: int) -> CellMLPConfig | SpatialTransformerConfig:
+        schema = (
+            CellMLPConfig if self.condition == "focal" else SpatialTransformerConfig
+        )
+        return schema(num_genes=num_genes, **self._normalized_model())
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -121,6 +162,7 @@ class SSLExperimentConfig:
         nested = dict(values)
         schemas = {
             "data": DataConfig,
+            "context": ContextConfig,
             "masking": MaskingConfig,
             "optimizer": OptimizerConfig,
             "training": TrainLoopConfig,

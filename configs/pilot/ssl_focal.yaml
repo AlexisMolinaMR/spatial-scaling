@@ -2,9 +2,13 @@ experiment_name: pilot_ssl_random_030
 output_dir: results/pilot_ssl/calibration/random_030
 seed: 123
 device: cuda
+condition: focal
 data:
   corpus_path: outputs/pilot_v0_synthetic_spatial
   cache_sections: 2
+context:
+  context_size: 256
+  shuffle_seed: 123
 model:
   hidden_dims: [128, 128]
   activation: gelu

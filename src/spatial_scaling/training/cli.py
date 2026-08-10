@@ -12,7 +12,7 @@ from spatial_scaling.training.trainer import run_experiment
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train Pilot v0 focal-cell SSL.")
+    parser = argparse.ArgumentParser(description="Train one Pilot v0 SSL model.")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument(
         "--override",

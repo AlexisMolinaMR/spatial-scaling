@@ -1,4 +1,4 @@
-"""Minimal reproducible trainer for focal-cell masked molecular modeling."""
+"""Reproducible trainer for focal and contextual masked molecular modeling."""
 
 from __future__ import annotations
 
@@ -19,11 +19,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+from spatial_scaling.data.synthetic.context import SyntheticContextDataset
 from spatial_scaling.data.synthetic.dataset import SyntheticExpressionDataset
 from spatial_scaling.evaluation.masked_expression import MaskedMetricAccumulator
 from spatial_scaling.models.cell_encoder import CellMLP
+from spatial_scaling.models.spatial_transformer import SpatialTransformer
 from spatial_scaling.training.config import SSLExperimentConfig
-from spatial_scaling.training.masking import MaskingConfig, build_masked_batch
+from spatial_scaling.training.masking import (
+    MaskingConfig,
+    build_masked_batch,
+    masks_for_cells,
+)
 from spatial_scaling.training.objective import masked_mse
 
 
@@ -95,14 +101,61 @@ def _index_digest(indices: np.ndarray) -> str:
     return hashlib.sha256(indices.astype("<i8", copy=False).tobytes()).hexdigest()
 
 
+def _evaluation_mask_digest(
+    dataset: SyntheticExpressionDataset,
+    indices: np.ndarray,
+    masking: MaskingConfig,
+    *,
+    batch_size: int,
+) -> str:
+    """Hash exact cell identities and fixed evaluation masks in index order."""
+    digest = hashlib.sha256()
+    for start in range(0, len(indices), batch_size):
+        batch_indices = indices[start : start + batch_size]
+        for index in batch_indices:
+            example = dataset[int(index)]
+            cell_id = example["cell_id"]
+            encoded = cell_id.encode("utf-8")
+            digest.update(len(encoded).to_bytes(4, "little"))
+            digest.update(encoded)
+            mask = masks_for_cells(dataset.num_genes, [cell_id], masking, epoch=0)[0]
+            digest.update(np.packbits(mask, bitorder="little").tobytes())
+    return digest.hexdigest()
+
+
+def _predict_contextual_batch(
+    model: SpatialTransformer,
+    context_data: SyntheticContextDataset,
+    section_offset: int,
+    offsets: np.ndarray,
+    masking: MaskingConfig,
+    device: torch.device,
+    *,
+    epoch: int,
+) -> tuple[torch.Tensor, Any]:
+    context = context_data.context_batch(section_offset, offsets)
+    expression = torch.from_numpy(context.focal_expression).to(device)
+    batch = build_masked_batch(expression, context.focal_cell_ids, masking, epoch=epoch)
+    context_expression = torch.from_numpy(context.context_expression).to(device)
+    relative_coordinates = torch.from_numpy(context.relative_coordinates_um).to(device)
+    predictions = model(
+        batch.masked_expression,
+        batch.visibility,
+        context_expression,
+        relative_coordinates,
+    )
+    return predictions, batch
+
+
 def evaluate_model(
-    model: CellMLP,
+    model: CellMLP | SpatialTransformer,
     dataset: SyntheticExpressionDataset,
     indices: np.ndarray,
     *,
     batch_size: int,
     masking: MaskingConfig,
     device: torch.device,
+    context_data: SyntheticContextDataset | None = None,
 ) -> dict[str, float | int]:
     """Evaluate fixed observations with fixed per-cell masks."""
     accumulator = MaskedMetricAccumulator(dataset.gene_metadata)
@@ -113,12 +166,30 @@ def evaluate_model(
             offsets = indices[section_offsets == section_offset]
             offsets = offsets % dataset.cells_per_section
             for start in range(0, len(offsets), batch_size):
-                values, cell_ids = dataset.section_batch(
-                    int(section_offset), offsets[start : start + batch_size]
-                )
-                expression = torch.from_numpy(values).to(device)
-                batch = build_masked_batch(expression, cell_ids, masking, epoch=0)
-                predictions = model(batch.masked_expression, batch.visibility)
+                batch_offsets = offsets[start : start + batch_size]
+                if isinstance(model, SpatialTransformer):
+                    if context_data is None:
+                        raise ValueError(
+                            "context_data is required for contextual model"
+                        )
+                    predictions, batch = _predict_contextual_batch(
+                        model,
+                        context_data,
+                        int(section_offset),
+                        batch_offsets,
+                        masking,
+                        device,
+                        epoch=0,
+                    )
+                else:
+                    if context_data is not None:
+                        raise ValueError("context_data cannot be used with focal model")
+                    values, cell_ids = dataset.section_batch(
+                        int(section_offset), batch_offsets
+                    )
+                    expression = torch.from_numpy(values).to(device)
+                    batch = build_masked_batch(expression, cell_ids, masking, epoch=0)
+                    predictions = model(batch.masked_expression, batch.visibility)
                 accumulator.update(predictions, batch.targets, batch.mask)
     return accumulator.compute()
 
@@ -196,6 +267,21 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
     )
     if train_data.gene_metadata != evaluation_data.gene_metadata:
         raise ValueError("training and evaluation gene metadata differ")
+    train_context: SyntheticContextDataset | None = None
+    evaluation_context: SyntheticContextDataset | None = None
+    if config.condition != "focal":
+        train_context = SyntheticContextDataset(
+            train_data,
+            context_size=config.context.context_size,
+            condition=config.condition,
+            shuffle_seed=config.context.shuffle_seed,
+        )
+        evaluation_context = SyntheticContextDataset(
+            evaluation_data,
+            context_size=config.context.context_size,
+            condition=config.condition,
+            shuffle_seed=config.context.shuffle_seed,
+        )
     evaluation_indices = evaluation_data.deterministic_indices(
         config.evaluation.max_cells, config.evaluation.observation_seed
     )
@@ -205,7 +291,11 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
         seed=config.evaluation.masking_seed,
         mask_value=config.masking.mask_value,
     )
-    model = CellMLP(config.model_config(train_data.num_genes)).to(device)
+    model_config = config.model_config(train_data.num_genes)
+    if config.condition == "focal":
+        model = CellMLP(model_config).to(device)
+    else:
+        model = SpatialTransformer(model_config).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.optimizer.learning_rate,
@@ -228,6 +318,12 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
         "index_sha256": _index_digest(evaluation_indices),
         "observation_seed": config.evaluation.observation_seed,
         "masking_seed": config.evaluation.masking_seed,
+        "mask_sha256": _evaluation_mask_digest(
+            evaluation_data,
+            evaluation_indices,
+            evaluation_masking,
+            batch_size=config.evaluation.batch_size,
+        ),
         "section_ids": list(evaluation_data.section_ids),
     }
     (output / "evaluation_observations.json").write_text(
@@ -242,6 +338,8 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
         json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
     )
 
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     started = time.perf_counter()
     initial_validation = evaluate_model(
         model,
@@ -250,6 +348,7 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
         batch_size=config.evaluation.batch_size,
         masking=evaluation_masking,
         device=device,
+        context_data=evaluation_context,
     )
     history: list[dict[str, float | int]] = [
         {
@@ -274,14 +373,27 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
             size=config.training.batch_size,
             replace=config.training.batch_size > train_data.cells_per_section,
         )
-        values, cell_ids = train_data.section_batch(section_offset, cell_offsets)
-        expression = torch.from_numpy(values).to(device)
         mask_epoch = (step - 1) // config.training.mask_epoch_steps
-        batch = build_masked_batch(
-            expression, cell_ids, config.masking, epoch=mask_epoch
-        )
         optimizer.zero_grad(set_to_none=True)
-        predictions = model(batch.masked_expression, batch.visibility)
+        if isinstance(model, SpatialTransformer):
+            if train_context is None:
+                raise RuntimeError("contextual model lacks contextual training data")
+            predictions, batch = _predict_contextual_batch(
+                model,
+                train_context,
+                section_offset,
+                cell_offsets,
+                config.masking,
+                device,
+                epoch=mask_epoch,
+            )
+        else:
+            values, cell_ids = train_data.section_batch(section_offset, cell_offsets)
+            expression = torch.from_numpy(values).to(device)
+            batch = build_masked_batch(
+                expression, cell_ids, config.masking, epoch=mask_epoch
+            )
+            predictions = model(batch.masked_expression, batch.visibility)
         loss = masked_mse(predictions, batch.targets, batch.mask)
         loss.backward()
         optimizer.step()
@@ -302,6 +414,7 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
                 batch_size=config.evaluation.batch_size,
                 masking=evaluation_masking,
                 device=device,
+                context_data=evaluation_context,
             )
             history.append(
                 {
@@ -318,6 +431,9 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elapsed_seconds = time.perf_counter() - started
+    peak_device_memory_bytes = (
+        int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
+    )
     final_validation = validation
     summary: dict[str, Any] = {
         "experiment_name": config.experiment_name,
@@ -325,6 +441,10 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
         "optimization_steps": config.training.steps,
         "examples_processed": config.training.steps * config.training.batch_size,
         "elapsed_seconds": elapsed_seconds,
+        "examples_per_second": (
+            config.training.steps * config.training.batch_size / elapsed_seconds
+        ),
+        "peak_device_memory_bytes": peak_device_memory_bytes,
         "device": str(device),
         "initial_validation": initial_validation,
         "final_validation": final_validation,

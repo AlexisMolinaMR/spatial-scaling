@@ -1,0 +1,39 @@
+experiment_name: pilot_spatial_positive_high_random_085_seed_101
+output_dir: results/pilot_spatial_falsification/positive/high_random_085/spatial/seed_101
+seed: 101
+device: cuda
+condition: spatial
+data:
+  corpus_path: outputs/pilot_v0_synthetic_spatial
+  cache_sections: 2
+context:
+  context_size: 256
+  shuffle_seed: 101
+model:
+  context_size: 256
+  embedding_dim: 64
+  num_layers: 2
+  num_heads: 4
+  ffn_width: 128
+  dropout: 0.0
+  coordinate_scale_um: 200.0
+masking:
+  policy: high_random
+  fraction: 0.85
+  seed: 101
+  mask_value: 0.0
+optimizer:
+  name: adamw
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+training:
+  batch_size: 32
+  steps: 2000
+  evaluation_interval: 250
+  mask_epoch_steps: 250
+evaluation:
+  split: validation
+  batch_size: 64
+  max_cells: 8192
+  observation_seed: 991
+  masking_seed: 101
