@@ -298,6 +298,14 @@ Pilot v0 includes a reproducible synthetic spatial-expression calibration
 corpus. Its mathematical definition, output schema, QC, and generation commands
 are documented in [`docs/pilot_v0.md`](docs/pilot_v0.md).
 
+The focal-cell masked molecular objective, leakage controls, and deterministic
+masking regimes are documented in
+[`docs/ssl_objective_v0.md`](docs/ssl_objective_v0.md).
+
+The K=256 true-spatial versus shuffled-context falsification design is
+documented in
+[`docs/spatial_falsification_v0.md`](docs/spatial_falsification_v0.md).
+
 ## Status
 
 Early research and infrastructure stage.
