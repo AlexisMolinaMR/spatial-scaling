@@ -294,6 +294,10 @@ Run linting:
 uv run ruff check .
 ```
 
+Pilot v0 includes a reproducible synthetic spatial-expression calibration
+corpus. Its mathematical definition, output schema, QC, and generation commands
+are documented in [`docs/pilot_v0.md`](docs/pilot_v0.md).
+
 ## Status
 
 Early research and infrastructure stage.
