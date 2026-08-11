@@ -11,6 +11,8 @@ data/*
 !data/.gitkeep
 outputs/*
 !outputs/.gitkeep
+results/*
+!results/.gitkeep
 
 # Cluster
 *.out

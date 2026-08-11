@@ -9,7 +9,10 @@ import pytest
 import torch
 
 from spatial_scaling.data.synthetic.config import SyntheticConfig
-from spatial_scaling.data.synthetic.context import SyntheticContextDataset
+from spatial_scaling.data.synthetic.context import (
+    ContextSelectionConfig,
+    SyntheticContextDataset,
+)
 from spatial_scaling.data.synthetic.dataset import SyntheticExpressionDataset
 from spatial_scaling.data.synthetic.generator import SyntheticCorpusGenerator
 from spatial_scaling.data.synthetic.storage import (
@@ -22,7 +25,16 @@ from spatial_scaling.models.spatial_transformer import (
     SpatialTransformer,
     SpatialTransformerConfig,
 )
-from spatial_scaling.spatial.neighborhoods import exact_knn_indices
+from spatial_scaling.spatial.neighborhoods import (
+    exact_distance_excluded_knn_indices,
+    exact_knn_indices,
+    selected_context_distances_um,
+    summarize_selected_context_distances_um,
+)
+from spatial_scaling.spatial.shuffling import (
+    matched_eligible_target_indices,
+    shuffled_context_indices,
+)
 from spatial_scaling.training.config import (
     ContextConfig,
     DataConfig,
@@ -80,8 +92,114 @@ def test_exact_knn_is_local_deterministic_and_excludes_focal() -> None:
     assert 3 not in first[1]
 
 
+@pytest.mark.parametrize("context_size", [1, 2, 4])
+def test_exact_knn_supports_low_context_sizes(context_size: int) -> None:
+    coordinates = np.column_stack((np.arange(8, dtype=float), np.zeros(8)))
+    selected = exact_knn_indices(coordinates, np.asarray([3]), context_size)
+    assert selected.shape == (1, context_size)
+    assert 3 not in selected[0]
+
+
+def test_distance_exclusion_is_exact_deterministic_and_fails_if_impossible() -> None:
+    coordinates = np.column_stack((np.arange(8, dtype=float), np.zeros(8)))
+    queries = np.asarray([2, 5])
+    first = exact_distance_excluded_knn_indices(
+        coordinates, queries, 2, minimum_distance_um=3.0
+    )
+    second = exact_distance_excluded_knn_indices(
+        coordinates, queries, 2, minimum_distance_um=3.0
+    )
+    np.testing.assert_array_equal(first, [[5, 6], [2, 1]])
+    np.testing.assert_array_equal(first, second)
+    distances = selected_context_distances_um(coordinates, queries, first)
+    assert np.all(distances >= 3.0)
+    with pytest.raises(ValueError, match="eligible context cells"):
+        exact_distance_excluded_knn_indices(
+            coordinates, np.asarray([3]), 4, minimum_distance_um=4.0
+        )
+
+
+def test_distance_shuffled_control_obeys_anchor_rule_and_true_exclusion() -> None:
+    coordinates = np.column_stack((np.arange(32, dtype=float), np.zeros(32)))
+    targets = np.asarray([3, 16, 28])
+    true_indices = exact_distance_excluded_knn_indices(
+        coordinates, targets, 3, minimum_distance_um=5.0
+    )
+    shuffled, anchors = shuffled_context_indices(
+        coordinates,
+        targets,
+        true_indices,
+        section_id="toy-section",
+        context_size=3,
+        seed=101,
+        minimum_distance_um=5.0,
+    )
+    repeated, repeated_anchors = shuffled_context_indices(
+        coordinates,
+        targets,
+        true_indices,
+        section_id="toy-section",
+        context_size=3,
+        seed=101,
+        minimum_distance_um=5.0,
+    )
+    np.testing.assert_array_equal(shuffled, repeated)
+    np.testing.assert_array_equal(anchors, repeated_anchors)
+    for target, anchor, true_row, shuffled_row in zip(
+        targets, anchors, true_indices, shuffled, strict=True
+    ):
+        assert target not in shuffled_row
+        assert anchor not in shuffled_row
+        assert set(true_row).isdisjoint(shuffled_row)
+        distances = np.abs(coordinates[shuffled_row, 0] - coordinates[anchor, 0])
+        assert np.all(distances >= 5.0)
+
+
+def test_matched_eligibility_returns_only_targets_valid_for_both_arms() -> None:
+    coordinates = np.column_stack((np.arange(32, dtype=float), np.zeros(32)))
+    eligible = matched_eligible_target_indices(
+        coordinates,
+        section_id="toy-section",
+        context_size=3,
+        seed=101,
+        minimum_distance_um=20.0,
+    )
+    assert 15 not in eligible
+    assert len(eligible) > 0
+    for target in eligible:
+        true_indices = exact_distance_excluded_knn_indices(
+            coordinates,
+            np.asarray([target]),
+            3,
+            minimum_distance_um=20.0,
+        )
+        shuffled_context_indices(
+            coordinates,
+            np.asarray([target]),
+            true_indices,
+            section_id="toy-section",
+            context_size=3,
+            seed=101,
+            minimum_distance_um=20.0,
+        )
+
+
+def test_selected_context_distance_summary_on_toy_coordinates() -> None:
+    distances = np.asarray([[1.0, 2.0, 5.0], [3.0, 4.0, 9.0]])
+    rows = summarize_selected_context_distances_um(distances)
+    by_statistic = {row["selected_distance_statistic"]: row for row in rows}
+    assert by_statistic["nearest"]["median_um"] == pytest.approx(2.0)
+    assert by_statistic["median"]["median_um"] == pytest.approx(3.0)
+    assert by_statistic["farthest"]["median_um"] == pytest.approx(7.0)
+
+
 def _context_dataset(
-    corpus: Path, *, condition: str, seed: int, context_size: int = 8
+    corpus: Path,
+    *,
+    condition: str,
+    seed: int,
+    context_size: int = 8,
+    selection: ContextSelectionConfig | None = None,
 ) -> SyntheticContextDataset:
     base = SyntheticExpressionDataset(corpus, "validation", cache_sections=1)
     return SyntheticContextDataset(
@@ -89,6 +207,7 @@ def _context_dataset(
         condition=condition,
         context_size=context_size,
         shuffle_seed=seed,
+        selection=selection,
     )
 
 
@@ -143,6 +262,33 @@ def test_shuffled_context_breaks_local_molecular_correspondence_and_is_seeded(
     ):
         assert target not in shuffled_indices
         assert set(true_indices).isdisjoint(shuffled_indices)
+
+
+def test_context_dataset_distance_selection_keeps_matched_slots_and_section(
+    corpora: dict[str, Path],
+) -> None:
+    selection = ContextSelectionConfig(
+        mode="distance_exclusion",
+        minimum_distance_um=10.0,
+        eligibility_minimum_distance_um=10.0,
+    )
+    targets = np.asarray([0, 9, 31])
+    spatial = _context_dataset(
+        corpora["positive"], condition="spatial", seed=5, selection=selection
+    ).context_batch(0, targets)
+    shuffled = _context_dataset(
+        corpora["positive"], condition="shuffled", seed=5, selection=selection
+    ).context_batch(0, targets)
+    assert spatial.context_indices.shape == shuffled.context_indices.shape == (3, 8)
+    np.testing.assert_array_equal(
+        spatial.relative_coordinates_um, shuffled.relative_coordinates_um
+    )
+    assert np.all(spatial.selected_distances_um >= 10.0)
+    assert spatial.section_id == shuffled.section_id
+    for true_row, shuffled_row in zip(
+        spatial.true_context_indices, shuffled.context_indices, strict=True
+    ):
+        assert set(true_row).isdisjoint(shuffled_row)
 
 
 def test_spatial_transformer_shape_leakage_interface_and_matched_capacity() -> None:
@@ -229,6 +375,37 @@ def test_matched_contextual_training_smoke_is_stable_and_mask_matched(
     assert spatial["evaluation_observations"] == shuffled["evaluation_observations"]
     assert np.isfinite(spatial["final_training_interval_masked_mse"])
     assert np.isfinite(shuffled["final_training_interval_masked_mse"])
+    for metrics in (spatial, shuffled):
+        assert metrics["training_batch_size"] == 4
+        assert metrics["effective_training_examples"] == 8
+        assert metrics["optimization_elapsed_seconds"] > 0
+        assert metrics["training_step_time_seconds_median"] > 0
+        assert metrics["examples_per_second"] > 0
+
+
+def test_distance_context_training_records_eligibility_and_realized_geometry(
+    corpora: dict[str, Path], tmp_path: Path
+) -> None:
+    selection = ContextSelectionConfig(
+        mode="distance_exclusion",
+        minimum_distance_um=10.0,
+        eligibility_minimum_distance_um=10.0,
+    )
+    summary = run_experiment(
+        _tiny_context_experiment(
+            corpora["positive"], tmp_path / "distance-spatial", "spatial"
+        ),
+        context_selection=selection,
+    )
+    assert summary["context_selection"] == selection.to_dict()
+    assert summary["context_eligibility"]["evaluation"]["common_threshold_eligible"] > 0
+    distributions = summary["context_distance_summary"]["distributions"]
+    assert {row["selected_distance_statistic"] for row in distributions} == {
+        "nearest",
+        "median",
+        "farthest",
+    }
+    assert all(row["median_um"] >= 10.0 for row in distributions)
 
 
 @pytest.mark.parametrize("context_size", [0, 64, 65])

@@ -12,6 +12,7 @@ import random
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,12 +20,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from spatial_scaling.data.synthetic.context import SyntheticContextDataset
+from spatial_scaling.data.synthetic.context import (
+    ContextSelectionConfig,
+    SyntheticContextDataset,
+)
 from spatial_scaling.data.synthetic.dataset import SyntheticExpressionDataset
 from spatial_scaling.evaluation.masked_expression import MaskedMetricAccumulator
 from spatial_scaling.models.cell_encoder import CellMLP
 from spatial_scaling.models.spatial_transformer import SpatialTransformer
-from spatial_scaling.training.config import SSLExperimentConfig
+from spatial_scaling.spatial.neighborhoods import (
+    exact_distance_excluded_knn_indices,
+    exact_knn_indices,
+    selected_context_distances_um,
+    summarize_selected_context_distances_um,
+)
+from spatial_scaling.training.config import SSLExperimentConfig, config_identity_sha256
 from spatial_scaling.training.masking import (
     MaskingConfig,
     build_masked_batch,
@@ -54,6 +64,34 @@ def _git_state() -> dict[str, Any]:
     return {"commit_sha": sha or None, "dirty": dirty}
 
 
+def _source_state() -> dict[str, Any]:
+    """Hash executable project sources when runs necessarily use a dirty tree."""
+    root = Path.cwd()
+    paths: list[Path] = []
+    for directory in ("src", "scripts", "configs", "slurm"):
+        candidate = root / directory
+        if candidate.is_dir():
+            paths.extend(
+                path
+                for path in candidate.rglob("*")
+                if path.is_file() and "__pycache__" not in path.parts
+            )
+    paths.extend(
+        path
+        for name in ("pyproject.toml", "uv.lock")
+        if (path := root / name).is_file()
+    )
+    files = {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(set(paths))
+    }
+    digest = hashlib.sha256()
+    for name, value in files.items():
+        digest.update(name.encode("utf-8"))
+        digest.update(value.encode("ascii"))
+    return {"tree_sha256": digest.hexdigest(), "files": files}
+
+
 def _environment() -> dict[str, Any]:
     packages = {}
     for name in ("numpy", "torch", "matplotlib", "pyyaml"):
@@ -69,6 +107,9 @@ def _environment() -> dict[str, Any]:
         "cuda_version": torch.version.cuda,
         "cudnn_version": torch.backends.cudnn.version(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "slurm_array_job_id": os.environ.get("SLURM_ARRAY_JOB_ID"),
+        "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
+        "hostname": platform.node(),
     }
 
 
@@ -91,10 +132,23 @@ def _set_reproducibility(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def _prepare_output(path: Path) -> None:
-    if path.exists() and any(path.iterdir()):
-        raise FileExistsError(f"experiment output directory is not empty: {path}")
-    path.mkdir(parents=True, exist_ok=True)
+def _prepare_output(path: Path) -> Path:
+    """Create a unique staging directory for an atomic completed run."""
+    if path.exists():
+        raise FileExistsError(f"experiment output path already exists: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    attempt = os.environ.get("SLURM_JOB_ID", f"pid{os.getpid()}")
+    staging = path.parent / f".{path.name}.in_progress_{attempt}"
+    if staging.exists():
+        raise FileExistsError(f"experiment staging directory already exists: {staging}")
+    staging.mkdir()
+    return staging
+
+
+def _publish_output(staging: Path, destination: Path) -> None:
+    if destination.exists():
+        raise FileExistsError(f"experiment output appeared during run: {destination}")
+    staging.replace(destination)
 
 
 def _index_digest(indices: np.ndarray) -> str:
@@ -121,6 +175,98 @@ def _evaluation_mask_digest(
             mask = masks_for_cells(dataset.num_genes, [cell_id], masking, epoch=0)[0]
             digest.update(np.packbits(mask, bitorder="little").tobytes())
     return digest.hexdigest()
+
+
+def _context_eligibility(
+    context: SyntheticContextDataset,
+) -> tuple[list[np.ndarray], dict[str, Any]]:
+    """Resolve exact current and common matched eligibility by section."""
+    common: list[np.ndarray] = []
+    section_rows = []
+    current_threshold = context.selection.minimum_distance_um
+    common_threshold = context.selection.eligibility_minimum_distance_um
+    for section_offset, section_id in enumerate(context.dataset.section_ids):
+        common_offsets = context.eligible_offsets(section_offset)
+        if current_threshold == common_threshold:
+            current_offsets = common_offsets
+        else:
+            current_offsets = context.eligible_offsets(
+                section_offset, minimum_distance_um=current_threshold
+            )
+        if not len(common_offsets):
+            raise ValueError(
+                f"section {section_id} has no common eligible focal observations"
+            )
+        common.append(common_offsets)
+        section_rows.append(
+            {
+                "section_id": section_id,
+                "total_observations": context.dataset.cells_per_section,
+                "current_threshold_eligible": len(current_offsets),
+                "common_threshold_eligible": len(common_offsets),
+            }
+        )
+    return common, {
+        "policy": "intersection_at_maximum_distance_threshold",
+        "selection_minimum_distance_um": current_threshold,
+        "eligibility_minimum_distance_um": common_threshold,
+        "total_observations": len(context.dataset),
+        "current_threshold_eligible": sum(
+            row["current_threshold_eligible"] for row in section_rows
+        ),
+        "common_threshold_eligible": sum(
+            row["common_threshold_eligible"] for row in section_rows
+        ),
+        "sections": section_rows,
+    }
+
+
+def _filter_evaluation_indices(
+    indices: np.ndarray,
+    dataset: SyntheticExpressionDataset,
+    eligible_by_section: list[np.ndarray],
+) -> np.ndarray:
+    keep = np.zeros(len(indices), dtype=bool)
+    section_offsets = indices // dataset.cells_per_section
+    cell_offsets = indices % dataset.cells_per_section
+    for section_offset in np.unique(section_offsets):
+        rows = section_offsets == section_offset
+        keep[rows] = np.isin(
+            cell_offsets[rows], eligible_by_section[int(section_offset)]
+        )
+    return indices[keep]
+
+
+def _context_distance_summary(
+    context: SyntheticContextDataset, indices: np.ndarray
+) -> dict[str, Any]:
+    """Measure true selected geometry for the exact evaluation observations."""
+    distances = []
+    section_offsets = indices // context.dataset.cells_per_section
+    for section_offset in np.unique(section_offsets):
+        queries = (
+            indices[section_offsets == section_offset]
+            % context.dataset.cells_per_section
+        )
+        _, coordinates, _ = context.dataset.spatial_section(int(section_offset))
+        if context.selection.mode == "nearest":
+            selected = exact_knn_indices(coordinates, queries, context.context_size)
+        else:
+            selected = exact_distance_excluded_knn_indices(
+                coordinates,
+                queries,
+                context.context_size,
+                minimum_distance_um=context.selection.minimum_distance_um,
+            )
+        distances.append(selected_context_distances_um(coordinates, queries, selected))
+    values = np.concatenate(distances, axis=0)
+    if len(values) != len(indices):
+        raise RuntimeError("context-distance observation count is inconsistent")
+    return {
+        "evaluation_targets": len(indices),
+        "selected_context_cells_per_target": context.context_size,
+        "distributions": summarize_selected_context_distances_um(values),
+    }
 
 
 def _predict_contextual_batch(
@@ -248,12 +394,22 @@ def _plot_history(path: Path, history: list[dict[str, float | int]]) -> None:
     plt.close(figure)
 
 
-def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
+def run_experiment(
+    config: SSLExperimentConfig,
+    *,
+    context_selection: ContextSelectionConfig | None = None,
+    expected_config_identity_sha256: str | None = None,
+) -> dict[str, Any]:
     """Train and evaluate one controlled masking configuration."""
     config.validate()
+    selection_was_explicit = context_selection is not None
+    selection = context_selection or ContextSelectionConfig()
+    selection.validate()
+    if config.condition == "focal" and selection_was_explicit:
+        raise ValueError("context selection cannot be supplied for a focal model")
     _set_reproducibility(config.seed)
-    output = Path(config.output_dir)
-    _prepare_output(output)
+    destination = Path(config.output_dir)
+    output = _prepare_output(destination)
     device = _select_device(config.device)
     train_data = SyntheticExpressionDataset(
         config.data.corpus_path,
@@ -275,16 +431,44 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
             context_size=config.context.context_size,
             condition=config.condition,
             shuffle_seed=config.context.shuffle_seed,
+            selection=selection,
         )
         evaluation_context = SyntheticContextDataset(
             evaluation_data,
             context_size=config.context.context_size,
             condition=config.condition,
             shuffle_seed=config.context.shuffle_seed,
+            selection=selection,
         )
-    evaluation_indices = evaluation_data.deterministic_indices(
+    requested_evaluation_indices = evaluation_data.deterministic_indices(
         config.evaluation.max_cells, config.evaluation.observation_seed
     )
+    train_eligible_by_section: list[np.ndarray] | None = None
+    eligibility: dict[str, Any] | None = None
+    if train_context is not None and evaluation_context is not None:
+        train_eligible_by_section, train_eligibility = _context_eligibility(
+            train_context
+        )
+        evaluation_eligible_by_section, evaluation_eligibility = _context_eligibility(
+            evaluation_context
+        )
+        evaluation_indices = _filter_evaluation_indices(
+            requested_evaluation_indices,
+            evaluation_data,
+            evaluation_eligible_by_section,
+        )
+        if not len(evaluation_indices):
+            raise ValueError(
+                "no requested evaluation observations are context-eligible"
+            )
+        eligibility = {
+            "train": train_eligibility,
+            "evaluation": evaluation_eligibility,
+            "requested_evaluation_observations": len(requested_evaluation_indices),
+            "retained_evaluation_observations": len(evaluation_indices),
+        }
+    else:
+        evaluation_indices = requested_evaluation_indices
     evaluation_masking = MaskingConfig(
         policy=config.masking.policy,
         fraction=config.masking.fraction,
@@ -302,7 +486,24 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
         weight_decay=config.optimizer.weight_decay,
     )
     resolved = config.to_dict()
+    identity_payload = (
+        {
+            "experiment_config": resolved,
+            "context_selection": selection.to_dict(),
+        }
+        if selection_was_explicit
+        else resolved
+    )
+    identity = config_identity_sha256(identity_payload)
+    if (
+        expected_config_identity_sha256 is not None
+        and identity != expected_config_identity_sha256
+    ):
+        raise ValueError("resolved run identity does not match manifest identity")
+    if selection_was_explicit:
+        resolved["context_selection"] = selection.to_dict()
     resolved["resolved_device"] = str(device)
+    resolved["config_identity_sha256"] = identity
     resolved["model"]["parameter_count"] = model.parameter_count
     resolved["section_ids"] = {
         "train": list(train_data.section_ids_by_split["train"]),
@@ -325,14 +526,37 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
             batch_size=config.evaluation.batch_size,
         ),
         "section_ids": list(evaluation_data.section_ids),
+        "requested_count": len(requested_evaluation_indices),
+        "eligibility": eligibility,
     }
     (output / "evaluation_observations.json").write_text(
         json.dumps(observations, indent=2) + "\n", encoding="utf-8"
     )
+    run_started_at = datetime.now(UTC)
+    device_information: dict[str, Any] = {"type": device.type}
+    if device.type == "cuda":
+        properties = torch.cuda.get_device_properties(device)
+        device_information.update(
+            {
+                "name": properties.name,
+                "total_memory_bytes": properties.total_memory,
+                "compute_capability": [properties.major, properties.minor],
+            }
+        )
     provenance = {
         "git": _git_state(),
+        "source_state": _source_state(),
         "environment": _environment(),
+        "device": device_information,
         "corpus_metadata": train_data.metadata,
+        "run": {
+            "experiment_id": config.experiment_name,
+            "config_identity_sha256": identity,
+            "started_at_utc": run_started_at.isoformat(),
+            "context_selection": (
+                selection.to_dict() if config.condition != "focal" else None
+            ),
+        },
     }
     (output / "provenance.json").write_text(
         json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
@@ -365,13 +589,28 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
     interval_losses: list[float] = []
     first_interval_loss: float | None = None
     final_training_loss: float | None = None
+    step_times: list[float] = []
     for step in range(1, config.training.steps + 1):
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        step_started = time.perf_counter()
         model.train()
         section_offset = int(sampling_rng.integers(len(train_data.section_ids)))
+        if train_eligible_by_section is None:
+            sampling_population: int | np.ndarray = train_data.cells_per_section
+            population_size = train_data.cells_per_section
+        else:
+            eligible_offsets = train_eligible_by_section[section_offset]
+            population_size = len(eligible_offsets)
+            sampling_population = (
+                train_data.cells_per_section
+                if population_size == train_data.cells_per_section
+                else eligible_offsets
+            )
         cell_offsets = sampling_rng.choice(
-            train_data.cells_per_section,
+            sampling_population,
             size=config.training.batch_size,
-            replace=config.training.batch_size > train_data.cells_per_section,
+            replace=config.training.batch_size > population_size,
         )
         mask_epoch = (step - 1) // config.training.mask_epoch_steps
         optimizer.zero_grad(set_to_none=True)
@@ -397,6 +636,9 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
         loss = masked_mse(predictions, batch.targets, batch.mask)
         loss.backward()
         optimizer.step()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        step_times.append(time.perf_counter() - step_started)
         interval_losses.append(float(loss.detach().item()))
         should_evaluate = (
             step % config.training.evaluation_interval == 0
@@ -434,18 +676,49 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
     peak_device_memory_bytes = (
         int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
     )
+    peak_device_memory_reserved_bytes = (
+        int(torch.cuda.max_memory_reserved(device)) if device.type == "cuda" else None
+    )
     final_validation = validation
+    optimization_elapsed_seconds = float(sum(step_times))
+    run_ended_at = datetime.now(UTC)
+    context_tokens_per_example = (
+        config.context.context_size + 1 if config.condition != "focal" else 1
+    )
     summary: dict[str, Any] = {
         "experiment_name": config.experiment_name,
+        "experiment_id": config.experiment_name,
+        "config_identity_sha256": identity,
         "parameter_count": model.parameter_count,
         "optimization_steps": config.training.steps,
+        "training_batch_size": config.training.batch_size,
         "examples_processed": config.training.steps * config.training.batch_size,
+        "effective_training_examples": config.training.steps
+        * config.training.batch_size,
+        "context_tokens_per_example": context_tokens_per_example,
+        "context_tokens_processed": config.training.steps
+        * config.training.batch_size
+        * context_tokens_per_example,
         "elapsed_seconds": elapsed_seconds,
+        "run_elapsed_seconds": elapsed_seconds,
+        "optimization_elapsed_seconds": optimization_elapsed_seconds,
+        "training_step_time_seconds_mean": float(np.mean(step_times)),
+        "training_step_time_seconds_median": float(np.median(step_times)),
         "examples_per_second": (
-            config.training.steps * config.training.batch_size / elapsed_seconds
+            config.training.steps
+            * config.training.batch_size
+            / optimization_elapsed_seconds
         ),
+        "context_tokens_per_second": config.training.steps
+        * config.training.batch_size
+        * context_tokens_per_example
+        / optimization_elapsed_seconds,
         "peak_device_memory_bytes": peak_device_memory_bytes,
+        "peak_device_memory_allocated_bytes": peak_device_memory_bytes,
+        "peak_device_memory_reserved_bytes": peak_device_memory_reserved_bytes,
         "device": str(device),
+        "started_at_utc": run_started_at.isoformat(),
+        "ended_at_utc": run_ended_at.isoformat(),
         "initial_validation": initial_validation,
         "final_validation": final_validation,
         "first_training_interval_masked_mse": first_interval_loss,
@@ -454,10 +727,25 @@ def run_experiment(config: SSLExperimentConfig) -> dict[str, Any]:
         - float(final_validation["masked_mse_all"])
         / float(initial_validation["masked_mse_all"]),
         "evaluation_observations": observations,
+        "context_selection": (
+            selection.to_dict() if config.condition != "focal" else None
+        ),
+        "context_eligibility": eligibility,
+        "context_distance_summary": (
+            _context_distance_summary(evaluation_context, evaluation_indices)
+            if evaluation_context is not None
+            else None
+        ),
     }
     (output / "metrics.json").write_text(
         json.dumps(summary, indent=2) + "\n", encoding="utf-8"
     )
     _write_history(output / "history.csv", history)
     _plot_history(output / "loss_curves.png", history)
+    provenance["run"]["ended_at_utc"] = run_ended_at.isoformat()
+    provenance["run"]["elapsed_seconds"] = elapsed_seconds
+    (output / "provenance.json").write_text(
+        json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
+    )
+    _publish_output(output, destination)
     return summary

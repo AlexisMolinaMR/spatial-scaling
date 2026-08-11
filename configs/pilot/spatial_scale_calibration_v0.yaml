@@ -1,0 +1,48 @@
+sweep_name: pilot_spatial_scale_calibration_v0
+base_config: configs/pilot/ssl_spatial_transformer.yaml
+output_root: results/pilot_spatial_scale_calibration_v0/runs
+corpora:
+  positive: outputs/pilot_v0_synthetic_spatial
+  "null": outputs/pilot_v0_synthetic_null
+seeds: [101, 202, 303]
+conditions: [shuffled, spatial]
+evaluation:
+  max_cells: 8192
+  observation_seed: 991
+sweeps:
+  - phase: low_k_positive_85
+    world: positive
+    masking:
+      regime: high_random_085
+      policy: high_random
+      fraction: 0.85
+    context_sizes: [1, 2, 4, 8, 16]
+    selection:
+      mode: nearest
+      minimum_distance_um: 0.0
+      eligibility_minimum_distance_um: 0.0
+  - phase: distance_positive_85
+    world: positive
+    masking:
+      regime: high_random_085_distance
+      policy: high_random
+      fraction: 0.85
+    context_sizes: [32]
+    minimum_distances_um: [0, 50, 100, 150, 200, 300, 400, 600]
+    eligibility_minimum_distance_um: 600
+  - phase: distance_null_85
+    world: "null"
+    masking:
+      regime: high_random_085_distance
+      policy: high_random
+      fraction: 0.85
+    context_sizes: [32]
+    minimum_distances_um: [0, 200, 600]
+    eligibility_minimum_distance_um: 600
+reuse:
+  - logical_phase: low_k_positive_85
+    source_spec: configs/pilot/context_scaling_v0.yaml
+    source_phase: primary_85
+    context_sizes: [32, 64]
+    source_summary: results/pilot_context_scaling_v0/final_summary/run_metrics.csv
+    source_git_sha: 7e0b4f4fabe5ad54669901a65af6d36febab0bec

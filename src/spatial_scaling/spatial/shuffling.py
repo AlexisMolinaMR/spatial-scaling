@@ -7,8 +7,9 @@ import hashlib
 import numpy as np
 
 from spatial_scaling.spatial.neighborhoods import (
-    exact_knn_indices,
+    exact_distance_excluded_knn_indices,
     validate_context_size,
+    validate_minimum_distance_um,
 )
 
 
@@ -49,6 +50,7 @@ def shuffled_context_indices(
     section_id: str,
     context_size: int,
     seed: int,
+    minimum_distance_um: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Select molecular context around wrong, seeded same-section anchors.
 
@@ -61,6 +63,7 @@ def shuffled_context_indices(
     """
     num_cells = len(coordinates)
     validate_context_size(num_cells, context_size)
+    threshold = validate_minimum_distance_um(minimum_distance_um)
     if num_cells < 2 * context_size + 1:
         raise ValueError(
             "shuffled control requires cells_per_section >= 2 * K + 1 so true "
@@ -77,15 +80,100 @@ def shuffled_context_indices(
         num_cells, section_id=section_id, seed=seed
     )
     anchors = anchors_by_target[targets]
-    candidate_size = min(num_cells - 1, 2 * context_size + 2)
-    candidates = exact_knn_indices(coordinates, anchors, candidate_size)
     result = np.empty_like(true_indices, dtype=np.int64)
+    positions = np.asarray(coordinates, dtype=np.float64)
     for row, target in enumerate(targets.astype(np.int64, copy=False)):
+        anchor = int(anchors[row])
+        delta = positions - positions[anchor]
+        squared_distance = np.einsum("ij,ij->i", delta, delta)
         forbidden = np.zeros(num_cells, dtype=bool)
         forbidden[true_indices[row]] = True
         forbidden[target] = True
-        allowed = candidates[row][~forbidden[candidates[row]]]
+        forbidden[anchor] = True
+        allowed = np.flatnonzero(
+            (~forbidden) & (squared_distance >= threshold * threshold)
+        )
         if len(allowed) < context_size:
-            raise RuntimeError("insufficient incorrect-context candidates")
-        result[row] = allowed[:context_size]
+            raise ValueError(
+                f"target {int(target)} has {len(allowed)} eligible shuffled "
+                f"context cells at d_min={threshold:g} um; requires K={context_size}"
+            )
+        allowed_distances = squared_distance[allowed]
+        candidates = np.argpartition(allowed_distances, context_size - 1)[:context_size]
+        cutoff = allowed_distances[candidates].max()
+        closest = allowed[allowed_distances <= cutoff]
+        order = np.lexsort((closest, squared_distance[closest]))
+        result[row] = closest[order[:context_size]]
     return result, anchors
+
+
+def _extreme_witness_indices(
+    coordinates: np.ndarray, *, minimum_count: int
+) -> np.ndarray:
+    """Return a deterministic subset used only to certify lower bounds."""
+    positions = np.asarray(coordinates, dtype=np.float64)
+    center = np.median(positions, axis=0)
+    squared_radius = np.einsum("ij,ij->i", positions - center, positions - center)
+    indices = np.arange(len(positions), dtype=np.int64)
+    order = np.lexsort((indices, -squared_radius))
+    return order[: min(len(order), minimum_count)]
+
+
+def matched_eligible_target_indices(
+    coordinates: np.ndarray,
+    *,
+    section_id: str,
+    context_size: int,
+    seed: int,
+    minimum_distance_um: float,
+) -> np.ndarray:
+    """Return targets valid for both true and shuffled distance controls.
+
+    Extreme cells provide an exact lower-bound certificate for the common case.
+    Any target not certified by that subset is checked by the full exact
+    selectors, so eligibility is never approximate.
+    """
+    positions = np.asarray(coordinates, dtype=np.float64)
+    num_cells = len(positions)
+    validate_context_size(num_cells, context_size)
+    threshold = validate_minimum_distance_um(minimum_distance_um)
+    if num_cells < 2 * context_size + 1:
+        raise ValueError("shuffled control requires cells_per_section >= 2 * K + 1")
+    if threshold == 0.0:
+        return np.arange(num_cells, dtype=np.int64)
+
+    witness_count = min(num_cells, max(6 * context_size + 16, 128))
+    witnesses = _extreme_witness_indices(positions, minimum_count=witness_count)
+    witness_delta = positions[:, None, :] - positions[witnesses][None, :, :]
+    witness_distance_sq = np.einsum("ijk,ijk->ij", witness_delta, witness_delta)
+    witness_eligible = witness_distance_sq >= threshold * threshold
+    witness_columns = {int(index): column for column, index in enumerate(witnesses)}
+    for index, column in witness_columns.items():
+        witness_eligible[index, column] = False
+    lower_bounds = witness_eligible.sum(axis=1)
+    anchors = target_anchor_permutation(num_cells, section_id=section_id, seed=seed)
+    certified = (lower_bounds >= context_size) & (
+        lower_bounds[anchors] >= 2 * context_size + 1
+    )
+    valid = certified.copy()
+    for target in np.flatnonzero(~certified):
+        try:
+            true_indices = exact_distance_excluded_knn_indices(
+                positions,
+                np.asarray([target]),
+                context_size,
+                minimum_distance_um=threshold,
+            )
+            shuffled_context_indices(
+                positions,
+                np.asarray([target]),
+                true_indices,
+                section_id=section_id,
+                context_size=context_size,
+                seed=seed,
+                minimum_distance_um=threshold,
+            )
+        except ValueError:
+            continue
+        valid[target] = True
+    return np.flatnonzero(valid).astype(np.int64, copy=False)

@@ -2,6 +2,10 @@
 
 Empirical scaling laws for spatial transcriptomics models.
 
+Pilot v0's controlled synthetic spatial-context sweep and its low-K/
+distance-exclusion calibration are documented in
+`docs/context_scaling_v0.md` and `docs/spatial_scale_calibration_v0.md`.
+
 Spatial representation learning is rapidly adopting larger datasets and increasingly complex architectures, but it is not yet clear what actually drives improvements in spatial biological models.
 
 This project studies how model performance changes as we independently scale:
@@ -297,6 +301,18 @@ uv run ruff check .
 Pilot v0 includes a reproducible synthetic spatial-expression calibration
 corpus. Its mathematical definition, output schema, QC, and generation commands
 are documented in [`docs/pilot_v0.md`](docs/pilot_v0.md).
+
+The focal-cell masked molecular objective, leakage controls, and deterministic
+masking regimes are documented in
+[`docs/ssl_objective_v0.md`](docs/ssl_objective_v0.md).
+
+The K=256 true-spatial versus shuffled-context falsification design is
+documented in
+[`docs/spatial_falsification_v0.md`](docs/spatial_falsification_v0.md).
+
+The manifest-driven spatial receptive-field sweep and computational profiling
+protocol are documented in
+[`docs/context_scaling_v0.md`](docs/context_scaling_v0.md).
 
 ## Status
 
