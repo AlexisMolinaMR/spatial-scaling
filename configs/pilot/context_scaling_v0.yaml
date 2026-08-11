@@ -1,0 +1,46 @@
+sweep_name: pilot_context_scaling_v0
+base_config: configs/pilot/ssl_spatial_transformer.yaml
+output_root: results/pilot_context_scaling_v0/runs
+corpora:
+  positive: outputs/pilot_v0_synthetic_spatial
+  "null": outputs/pilot_v0_synthetic_null
+seeds: [101, 202, 303]
+conditions: [shuffled, spatial]
+evaluation:
+  max_cells: 8192
+  observation_seed: 991
+sweeps:
+  - phase: primary_85
+    world: positive
+    masking:
+      regime: high_random_085
+      policy: high_random
+      fraction: 0.85
+    context_sizes: [32, 64, 128, 256, 512, 1024]
+  - phase: null_85
+    world: "null"
+    masking:
+      regime: high_random_085
+      policy: high_random
+      fraction: 0.85
+    context_sizes: [32, 256, 1024]
+  - phase: secondary_30
+    world: positive
+    masking:
+      regime: random_030
+      policy: random
+      fraction: 0.30
+    context_sizes: [64, 256, 1024]
+  - phase: feasibility_2048
+    world: positive
+    masking:
+      regime: high_random_085_probe
+      policy: high_random
+      fraction: 0.85
+    context_sizes: [2048]
+    seeds: [101]
+    evaluation_max_cells: 64
+    training:
+      steps: 50
+      evaluation_interval: 50
+      mask_epoch_steps: 50

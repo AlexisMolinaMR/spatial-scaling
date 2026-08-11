@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -212,3 +214,11 @@ def load_experiment_config(
     for override in overrides:
         apply_override(values, override)
     return SSLExperimentConfig.from_dict(values)
+
+
+def config_identity_sha256(values: dict[str, Any]) -> str:
+    """Return a stable identity for one completely resolved configuration."""
+    payload = json.dumps(
+        values, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
