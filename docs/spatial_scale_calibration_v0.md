@@ -132,5 +132,6 @@ These measurements support the local-redundancy hypothesis: one extremely
 nearby cell is already highly informative, while removing nearby molecular
 observations reveals a physical decay broadly comparable to, but not equated
 with, the configured 200 µm RBF scale. No correlation length or scaling law is
-fitted. The synthetic spatial calibration stage passes and is sufficiently
-understood to proceed to a separately designed N_train scaling stage.
+fitted. The synthetic spatial calibration stage passed and Pilot v0 proceeded
+to training-data methodology calibration. The project was subsequently closed
+following a research pivot; see `docs/pilot_v0_closure.md`.

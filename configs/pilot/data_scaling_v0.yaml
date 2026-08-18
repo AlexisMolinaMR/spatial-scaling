@@ -1,0 +1,86 @@
+sweep_name: pilot_data_scaling_v0
+base_configs:
+  contextual: configs/pilot/ssl_spatial_transformer.yaml
+  focal: configs/pilot/ssl_focal.yaml
+output_root: results/pilot_data_scaling_v0/runs
+corpora:
+  positive: outputs/pilot_v0_synthetic_spatial
+  "null": outputs/pilot_v0_synthetic_null
+subset_selection_seed: 314159
+scale_points_sections: [1, 2, 4, 8, 16, 32, 48]
+seeds: [101, 202, 303]
+context_size: 32
+masking:
+  policy: high_random
+  fraction: 0.85
+evaluation:
+  max_cells: 8192
+  observation_seed: 991
+  masking_seed: 992
+policies:
+  converged_data_frontier:
+    name: converged_data_frontier
+    sampling: deterministic_shuffled_epochs
+    lr_schedule: constant
+    minimum_epochs: 2
+    maximum_epochs: 10
+    validation_interval_epochs: 1
+    early_stopping_patience: 3
+    improvement_threshold: 0.0001
+    absolute_max_steps: 150000
+    fixed_steps: null
+    restore_best_validation: true
+  fixed_compute_2000_steps:
+    name: fixed_compute_2000_steps
+    sampling: historical_random_with_replacement
+    lr_schedule: constant
+    minimum_epochs: null
+    maximum_epochs: null
+    validation_interval_epochs: null
+    early_stopping_patience: null
+    improvement_threshold: null
+    absolute_max_steps: null
+    fixed_steps: 2000
+    restore_best_validation: false
+  smoke_minimum_exposure:
+    name: smoke_minimum_exposure
+    sampling: deterministic_shuffled_epochs
+    lr_schedule: constant
+    minimum_epochs: 1
+    maximum_epochs: 1
+    validation_interval_epochs: 1
+    early_stopping_patience: 1
+    improvement_threshold: 0.0001
+    absolute_max_steps: 20000
+    fixed_steps: null
+    restore_best_validation: true
+sweeps:
+  - phase: primary_positive_85
+    world: positive
+    model_family: contextual
+    training_protocol: converged_data_frontier
+    conditions: [shuffled, spatial]
+  - phase: required_null_85
+    world: "null"
+    model_family: contextual
+    training_protocol: converged_data_frontier
+    conditions: [shuffled, spatial]
+    scale_points_sections: [1, 8, 48]
+  - phase: fixed_compute_positive_85
+    world: positive
+    model_family: contextual
+    training_protocol: fixed_compute_2000_steps
+    conditions: [shuffled, spatial]
+    scale_points_sections: [1, 8, 48]
+  - phase: focal_reference_85
+    world: positive
+    model_family: focal
+    training_protocol: converged_data_frontier
+    conditions: [focal]
+  - phase: smoke_positive_85
+    world: positive
+    model_family: contextual
+    training_protocol: smoke_minimum_exposure
+    conditions: [spatial]
+    scale_points_sections: [1, 48]
+    seeds: [101]

@@ -1,0 +1,46 @@
+sweep_name: pilot_data_scaling_endpoint_convergence_v0
+base_configs:
+  contextual: configs/pilot/ssl_spatial_transformer.yaml
+  focal: configs/pilot/ssl_focal.yaml
+output_root: results/pilot_data_scaling_endpoint_convergence_v0/runs
+corpora:
+  positive: outputs/pilot_v0_synthetic_spatial
+  "null": outputs/pilot_v0_synthetic_null
+subset_selection_seed: 314159
+scale_points_sections: [1, 2, 4, 8, 16, 32, 48]
+seeds: [101, 202, 303]
+context_size: 32
+masking:
+  policy: high_random
+  fraction: 0.85
+evaluation:
+  max_cells: 8192
+  observation_seed: 991
+  masking_seed: 992
+policies:
+  converged_data_frontier:
+    name: converged_data_frontier
+    sampling: deterministic_shuffled_epochs
+    lr_schedule: constant
+    minimum_epochs: 2
+    maximum_epochs: 30
+    validation_interval_epochs: 1
+    early_stopping_patience: 3
+    improvement_threshold: 0.0001
+    absolute_max_steps: 400000
+    fixed_steps: null
+    restore_best_validation: true
+sweeps:
+  - phase: endpoint_convergence_positive_85
+    world: positive
+    model_family: contextual
+    training_protocol: converged_data_frontier
+    conditions: [shuffled, spatial]
+    scale_points_sections: [1, 48]
+provenance:
+  purpose: endpoint convergence diagnostic extending the common cap from 10 to 30 passes
+  historical_spec: configs/pilot/data_scaling_v0.yaml
+  historical_manifest: results/pilot_data_scaling_v0/manifests/primary.json
+  historical_results_root: results/pilot_data_scaling_v0/runs
+  historical_phase: primary_positive_85
+

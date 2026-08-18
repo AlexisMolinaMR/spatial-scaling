@@ -1,0 +1,50 @@
+sweep_name: pilot_data_scaling_spatial_90pass_convergence_v0
+base_configs:
+  contextual: configs/pilot/ssl_spatial_transformer.yaml
+  focal: configs/pilot/ssl_focal.yaml
+output_root: results/pilot_data_scaling_spatial_90pass_convergence_v0/runs
+corpora:
+  positive: outputs/pilot_v0_synthetic_spatial
+  "null": outputs/pilot_v0_synthetic_null
+subset_selection_seed: 314159
+scale_points_sections: [1, 2, 4, 8, 16, 32, 48]
+seeds: [101, 202, 303]
+context_size: 32
+masking:
+  policy: high_random
+  fraction: 0.85
+evaluation:
+  max_cells: 8192
+  observation_seed: 991
+  masking_seed: 992
+policies:
+  validation_plateau_lr_decay:
+    name: validation_plateau_lr_decay
+    sampling: deterministic_shuffled_epochs
+    lr_schedule: validation_plateau_decay
+    minimum_epochs: 2
+    maximum_epochs: 90
+    validation_interval_epochs: 1
+    early_stopping_patience: 8
+    improvement_threshold: 0.0001
+    absolute_max_steps: 1200000
+    fixed_steps: null
+    restore_best_validation: true
+    lr_reduction_factor: 0.3
+    lr_reduction_patience: 3
+    minimum_learning_rate: 0.00001
+sweeps:
+  - phase: spatial_plateau_decay_90
+    world: positive
+    model_family: contextual
+    training_protocol: validation_plateau_lr_decay
+    conditions: [spatial]
+    scale_points_sections: [1, 48]
+provenance:
+  purpose: 90-pass safety-cap convergence diagnostic for true-spatial endpoints
+  execution_mode: restart_from_zero
+  restart_reason: pass-60 outputs contain no complete resumable training checkpoint
+  historical_60_pass_spec: configs/pilot/data_scaling_endpoint_lr_policy_v0.yaml
+  historical_60_pass_manifest: results/pilot_data_scaling_endpoint_lr_policy_v0/manifests/endpoint_lr_policy.json
+  historical_60_pass_results_root: results/pilot_data_scaling_endpoint_lr_policy_v0/runs
+  converged_shuffled_summary: results/pilot_data_scaling_endpoint_lr_policy_v0/final_summary/run_summary.csv

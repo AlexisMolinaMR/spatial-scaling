@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import csv
 import hashlib
 import importlib.metadata
@@ -41,6 +42,12 @@ from spatial_scaling.training.masking import (
     masks_for_cells,
 )
 from spatial_scaling.training.objective import masked_mse
+from spatial_scaling.training.policies import (
+    TrainingDataSelection,
+    TrainingExecutionPolicy,
+    ValidationConvergenceController,
+    ValidationPlateauController,
+)
 
 
 def _git_state() -> dict[str, Any]:
@@ -153,6 +160,15 @@ def _publish_output(staging: Path, destination: Path) -> None:
 
 def _index_digest(indices: np.ndarray) -> str:
     return hashlib.sha256(indices.astype("<i8", copy=False).tobytes()).hexdigest()
+
+
+def _stable_seed(*components: object) -> int:
+    digest = hashlib.blake2b(digest_size=8)
+    for component in components:
+        encoded = str(component).encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "little"))
+        digest.update(encoded)
+    return int.from_bytes(digest.digest(), "little")
 
 
 def _evaluation_mask_digest(
@@ -398,6 +414,8 @@ def run_experiment(
     config: SSLExperimentConfig,
     *,
     context_selection: ContextSelectionConfig | None = None,
+    training_data_selection: TrainingDataSelection | None = None,
+    execution_policy: TrainingExecutionPolicy | None = None,
     expected_config_identity_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Train and evaluate one controlled masking configuration."""
@@ -405,6 +423,20 @@ def run_experiment(
     selection_was_explicit = context_selection is not None
     selection = context_selection or ContextSelectionConfig()
     selection.validate()
+    if training_data_selection is not None:
+        training_data_selection.validate()
+    if execution_policy is not None:
+        execution_policy.validate()
+        if (
+            execution_policy.name == "fixed_compute_2000_steps"
+            and config.training.steps != 2000
+        ):
+            raise ValueError("fixed-compute configuration must request 2,000 steps")
+        if (
+            execution_policy.lr_schedule == "validation_plateau_decay"
+            and execution_policy.minimum_learning_rate >= config.optimizer.learning_rate
+        ):
+            raise ValueError("minimum learning rate must be below the base LR")
     if config.condition == "focal" and selection_was_explicit:
         raise ValueError("context selection cannot be supplied for a focal model")
     _set_reproducibility(config.seed)
@@ -415,6 +447,11 @@ def run_experiment(
         config.data.corpus_path,
         "train",
         cache_sections=config.data.cache_sections,
+        section_ids=(
+            training_data_selection.active_train_section_ids
+            if training_data_selection is not None
+            else None
+        ),
     )
     evaluation_data = SyntheticExpressionDataset(
         config.data.corpus_path,
@@ -486,13 +523,15 @@ def run_experiment(
         weight_decay=config.optimizer.weight_decay,
     )
     resolved = config.to_dict()
+    extensions: dict[str, Any] = {}
+    if selection_was_explicit:
+        extensions["context_selection"] = selection.to_dict()
+    if training_data_selection is not None:
+        extensions["training_data_selection"] = training_data_selection.to_dict()
+    if execution_policy is not None:
+        extensions["execution_policy"] = execution_policy.to_dict()
     identity_payload = (
-        {
-            "experiment_config": resolved,
-            "context_selection": selection.to_dict(),
-        }
-        if selection_was_explicit
-        else resolved
+        {"experiment_config": resolved, **extensions} if extensions else resolved
     )
     identity = config_identity_sha256(identity_payload)
     if (
@@ -502,6 +541,10 @@ def run_experiment(
         raise ValueError("resolved run identity does not match manifest identity")
     if selection_was_explicit:
         resolved["context_selection"] = selection.to_dict()
+    if training_data_selection is not None:
+        resolved["training_data_selection"] = training_data_selection.to_dict()
+    if execution_policy is not None:
+        resolved["execution_policy"] = execution_policy.to_dict()
     resolved["resolved_device"] = str(device)
     resolved["config_identity_sha256"] = identity
     resolved["model"]["parameter_count"] = model.parameter_count
@@ -510,6 +553,7 @@ def run_experiment(
         "validation": list(train_data.section_ids_by_split["validation"]),
         "test": list(train_data.section_ids_by_split["test"]),
     }
+    resolved["active_training_section_ids"] = list(train_data.section_ids)
     (output / "resolved_config.json").write_text(
         json.dumps(resolved, indent=2) + "\n", encoding="utf-8"
     )
@@ -556,6 +600,14 @@ def run_experiment(
             "context_selection": (
                 selection.to_dict() if config.condition != "focal" else None
             ),
+            "training_data_selection": (
+                training_data_selection.to_dict()
+                if training_data_selection is not None
+                else None
+            ),
+            "execution_policy": (
+                execution_policy.to_dict() if execution_policy is not None else None
+            ),
         },
     }
     (output / "provenance.json").write_text(
@@ -577,6 +629,11 @@ def run_experiment(
     history: list[dict[str, float | int]] = [
         {
             "step": 0,
+            "epoch": 0.0,
+            "learning_rate": config.optimizer.learning_rate,
+            "learning_rate_after_validation": config.optimizer.learning_rate,
+            "lr_reduction_event": False,
+            "early_stopping_decision": False,
             "train_masked_mse": "",
             **{
                 f"validation_{name}": value
@@ -585,33 +642,41 @@ def run_experiment(
             },
         }
     ]
-    sampling_rng = np.random.default_rng(config.seed)
     interval_losses: list[float] = []
     first_interval_loss: float | None = None
     final_training_loss: float | None = None
     step_times: list[float] = []
-    for step in range(1, config.training.steps + 1):
+    step = 0
+    examples_processed = 0
+    epochs_completed = 0
+    early_stopping_reason = "fixed_steps_completed"
+    lr_reduction_events: list[dict[str, float | int]] = []
+    exposure_counts = np.zeros(len(train_data.section_ids), dtype=np.int64)
+    seen_offsets = [
+        np.zeros(train_data.cells_per_section, dtype=bool)
+        for _ in train_data.section_ids
+    ]
+    available_by_section = [
+        (
+            np.arange(train_data.cells_per_section, dtype=np.int64)
+            if train_eligible_by_section is None
+            else train_eligible_by_section[section_offset]
+        )
+        for section_offset in range(len(train_data.section_ids))
+    ]
+    available_training_observations = sum(map(len, available_by_section))
+
+    def train_batch(section_offset: int, cell_offsets: np.ndarray) -> float:
+        nonlocal step, examples_processed
+        step += 1
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         step_started = time.perf_counter()
         model.train()
-        section_offset = int(sampling_rng.integers(len(train_data.section_ids)))
-        if train_eligible_by_section is None:
-            sampling_population: int | np.ndarray = train_data.cells_per_section
-            population_size = train_data.cells_per_section
-        else:
-            eligible_offsets = train_eligible_by_section[section_offset]
-            population_size = len(eligible_offsets)
-            sampling_population = (
-                train_data.cells_per_section
-                if population_size == train_data.cells_per_section
-                else eligible_offsets
-            )
-        cell_offsets = sampling_rng.choice(
-            sampling_population,
-            size=config.training.batch_size,
-            replace=config.training.batch_size > population_size,
-        )
+        cell_offsets = np.asarray(cell_offsets, dtype=np.int64)
+        exposure_counts[section_offset] += len(cell_offsets)
+        seen_offsets[section_offset][cell_offsets] = True
+        examples_processed += len(cell_offsets)
         mask_epoch = (step - 1) // config.training.mask_epoch_steps
         optimizer.zero_grad(set_to_none=True)
         if isinstance(model, SpatialTransformer):
@@ -639,17 +704,140 @@ def run_experiment(
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         step_times.append(time.perf_counter() - step_started)
-        interval_losses.append(float(loss.detach().item()))
-        should_evaluate = (
-            step % config.training.evaluation_interval == 0
-            or step == config.training.steps
+        value = float(loss.detach().item())
+        interval_losses.append(value)
+        return value
+
+    def evaluate_and_record(epoch: float) -> dict[str, float | int]:
+        nonlocal first_interval_loss, final_training_loss, interval_losses
+        mean_train_loss = float(np.mean(interval_losses))
+        if first_interval_loss is None:
+            first_interval_loss = mean_train_loss
+        final_training_loss = mean_train_loss
+        current = evaluate_model(
+            model,
+            evaluation_data,
+            evaluation_indices,
+            batch_size=config.evaluation.batch_size,
+            masking=evaluation_masking,
+            device=device,
+            context_data=evaluation_context,
         )
-        if should_evaluate:
-            mean_train_loss = float(np.mean(interval_losses))
-            if first_interval_loss is None:
-                first_interval_loss = mean_train_loss
-            final_training_loss = mean_train_loss
-            validation = evaluate_model(
+        history.append(
+            {
+                "step": step,
+                "epoch": epoch,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+                "learning_rate_after_validation": optimizer.param_groups[0]["lr"],
+                "lr_reduction_event": False,
+                "early_stopping_decision": False,
+                "train_masked_mse": mean_train_loss,
+                **{
+                    f"validation_{name}": value
+                    for name, value in current.items()
+                    if name.startswith("masked_mse_")
+                },
+            }
+        )
+        interval_losses = []
+        return current
+
+    validation = initial_validation
+    best_validation = initial_validation
+    best_validation_step = 0
+    best_validation_epoch = 0
+    best_state = copy.deepcopy(model.state_dict())
+    if execution_policy is not None and execution_policy.sampling == (
+        "deterministic_shuffled_epochs"
+    ):
+        plateau_controller = (
+            ValidationPlateauController(
+                reduction_factor=execution_policy.lr_reduction_factor,
+                reduction_patience=execution_policy.lr_reduction_patience,
+                minimum_learning_rate=execution_policy.minimum_learning_rate,
+            )
+            if execution_policy.lr_schedule == "validation_plateau_decay"
+            else None
+        )
+        convergence_controller = ValidationConvergenceController(
+            best_loss=float(initial_validation["masked_mse_all"]),
+            improvement_threshold=execution_policy.improvement_threshold,
+            early_stopping_patience=execution_policy.early_stopping_patience,
+            plateau=plateau_controller,
+        )
+        reached_absolute_cap = False
+        for epoch in range(1, execution_policy.maximum_epochs + 1):
+            epoch_rng = np.random.default_rng(
+                _stable_seed("data-scaling-epoch", config.seed, epoch)
+            )
+            section_order = epoch_rng.permutation(len(train_data.section_ids))
+            for section_offset_value in section_order:
+                section_offset = int(section_offset_value)
+                offsets = np.array(
+                    available_by_section[section_offset], dtype=np.int64, copy=True
+                )
+                epoch_rng.shuffle(offsets)
+                for start in range(0, len(offsets), config.training.batch_size):
+                    if step >= execution_policy.absolute_max_steps:
+                        reached_absolute_cap = True
+                        break
+                    train_batch(
+                        section_offset,
+                        offsets[start : start + config.training.batch_size],
+                    )
+                if reached_absolute_cap:
+                    break
+            if reached_absolute_cap:
+                early_stopping_reason = "absolute_max_steps"
+                if epoch <= execution_policy.minimum_epochs:
+                    raise RuntimeError(
+                        "absolute step cap prevented the minimum exposure policy"
+                    )
+                break
+            epochs_completed = epoch
+            if epoch == 1:
+                unique_seen = sum(int(values.sum()) for values in seen_offsets)
+                if unique_seen != available_training_observations:
+                    raise RuntimeError(
+                        "deterministic epoch failed to expose every focal observation"
+                    )
+            validation = evaluate_and_record(float(epoch))
+            current_loss = float(validation["masked_mse_all"])
+            current_lr = float(optimizer.param_groups[0]["lr"])
+            decision = convergence_controller.update(
+                validation_loss=current_loss,
+                current_learning_rate=current_lr,
+            )
+            if decision.improved:
+                best_validation = validation
+                best_validation_step = step
+                best_validation_epoch = epoch
+                best_state = copy.deepcopy(model.state_dict())
+            if decision.lr_reduced:
+                if plateau_controller is None:
+                    raise RuntimeError("LR reduction lacks plateau controller")
+                next_lr = decision.learning_rate
+                for group in optimizer.param_groups:
+                    group["lr"] = next_lr
+                event = {
+                    "epoch": epoch,
+                    "step": step,
+                    "validation_masked_mse_all": current_loss,
+                    "previous_learning_rate": current_lr,
+                    "new_learning_rate": next_lr,
+                }
+                lr_reduction_events.append(event)
+                history[-1]["learning_rate_after_validation"] = next_lr
+                history[-1]["lr_reduction_event"] = True
+            if epoch >= execution_policy.minimum_epochs and decision.should_stop:
+                early_stopping_reason = "early_stopping_patience"
+                history[-1]["early_stopping_decision"] = True
+                break
+        else:
+            early_stopping_reason = "maximum_epochs"
+        if execution_policy.restore_best_validation:
+            model.load_state_dict(best_state)
+            final_validation = evaluate_model(
                 model,
                 evaluation_data,
                 evaluation_indices,
@@ -658,18 +846,40 @@ def run_experiment(
                 device=device,
                 context_data=evaluation_context,
             )
-            history.append(
-                {
-                    "step": step,
-                    "train_masked_mse": mean_train_loss,
-                    **{
-                        f"validation_{name}": value
-                        for name, value in validation.items()
-                        if name.startswith("masked_mse_")
-                    },
-                }
+        else:
+            final_validation = validation
+    else:
+        sampling_rng = np.random.default_rng(config.seed)
+        fixed_steps = (
+            execution_policy.fixed_steps
+            if execution_policy is not None
+            else config.training.steps
+        )
+        for _ in range(fixed_steps):
+            section_offset = int(sampling_rng.integers(len(train_data.section_ids)))
+            sampling_population = available_by_section[section_offset]
+            population_size = len(sampling_population)
+            cell_offsets = sampling_rng.choice(
+                sampling_population,
+                size=config.training.batch_size,
+                replace=config.training.batch_size > population_size,
             )
-            interval_losses = []
+            train_batch(section_offset, cell_offsets)
+            should_evaluate = (
+                step % config.training.evaluation_interval == 0 or step == fixed_steps
+            )
+            if should_evaluate:
+                validation = evaluate_and_record(
+                    examples_processed / available_training_observations
+                )
+        final_validation = validation
+        best_validation = min(
+            (initial_validation, validation),
+            key=lambda values: float(values["masked_mse_all"]),
+        )
+        if best_validation is validation:
+            best_validation_step = step
+            best_validation_epoch = examples_processed / available_training_observations
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elapsed_seconds = time.perf_counter() - started
@@ -679,38 +889,72 @@ def run_experiment(
     peak_device_memory_reserved_bytes = (
         int(torch.cuda.max_memory_reserved(device)) if device.type == "cuda" else None
     )
-    final_validation = validation
     optimization_elapsed_seconds = float(sum(step_times))
     run_ended_at = datetime.now(UTC)
     context_tokens_per_example = (
         config.context.context_size + 1 if config.condition != "focal" else 1
     )
+    unique_observations_seen = sum(int(values.sum()) for values in seen_offsets)
+    effective_passes = examples_processed / available_training_observations
+    section_exposure = []
+    for section_offset, section_id in enumerate(train_data.section_ids):
+        available_offsets = available_by_section[section_offset]
+        section_exposure.append(
+            {
+                "section_id": section_id,
+                "available_observations": len(available_offsets),
+                "examples_processed": int(exposure_counts[section_offset]),
+                "unique_observations_seen": int(
+                    seen_offsets[section_offset][available_offsets].sum()
+                ),
+            }
+        )
     summary: dict[str, Any] = {
         "experiment_name": config.experiment_name,
         "experiment_id": config.experiment_name,
         "config_identity_sha256": identity,
         "parameter_count": model.parameter_count,
-        "optimization_steps": config.training.steps,
+        "optimization_steps": step,
         "training_batch_size": config.training.batch_size,
-        "examples_processed": config.training.steps * config.training.batch_size,
-        "effective_training_examples": config.training.steps
-        * config.training.batch_size,
+        "examples_processed": examples_processed,
+        "effective_training_examples": examples_processed,
+        "available_training_observations": available_training_observations,
+        "unique_training_observations_seen": unique_observations_seen,
+        "unique_observation_fraction": unique_observations_seen
+        / available_training_observations,
+        "effective_passes": effective_passes,
+        "epochs_completed": epochs_completed,
+        "early_stopping_reason": early_stopping_reason,
+        "lr_reduction_events": lr_reduction_events,
+        "num_lr_reductions": len(lr_reduction_events),
+        "final_learning_rate": float(optimizer.param_groups[0]["lr"]),
+        "best_validation_step": best_validation_step,
+        "best_validation_epoch": best_validation_epoch,
+        "best_validation": best_validation,
+        "minimum_exposure_required": bool(
+            execution_policy is not None
+            and execution_policy.sampling == "deterministic_shuffled_epochs"
+        ),
+        "minimum_exposure_satisfied": unique_observations_seen
+        == available_training_observations,
+        "section_exposure": section_exposure,
+        "training_data_selection": (
+            training_data_selection.to_dict()
+            if training_data_selection is not None
+            else None
+        ),
+        "execution_policy": (
+            execution_policy.to_dict() if execution_policy is not None else None
+        ),
         "context_tokens_per_example": context_tokens_per_example,
-        "context_tokens_processed": config.training.steps
-        * config.training.batch_size
-        * context_tokens_per_example,
+        "context_tokens_processed": examples_processed * context_tokens_per_example,
         "elapsed_seconds": elapsed_seconds,
         "run_elapsed_seconds": elapsed_seconds,
         "optimization_elapsed_seconds": optimization_elapsed_seconds,
         "training_step_time_seconds_mean": float(np.mean(step_times)),
         "training_step_time_seconds_median": float(np.median(step_times)),
-        "examples_per_second": (
-            config.training.steps
-            * config.training.batch_size
-            / optimization_elapsed_seconds
-        ),
-        "context_tokens_per_second": config.training.steps
-        * config.training.batch_size
+        "examples_per_second": examples_processed / optimization_elapsed_seconds,
+        "context_tokens_per_second": examples_processed
         * context_tokens_per_example
         / optimization_elapsed_seconds,
         "peak_device_memory_bytes": peak_device_memory_bytes,
