@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,7 @@ class SyntheticExpressionDataset(Dataset[dict[str, Any]]):
         split: str,
         *,
         cache_sections: int = 2,
+        section_ids: Sequence[str] | None = None,
     ) -> None:
         if split not in SPLITS:
             raise ValueError(f"split must be one of {SPLITS}; got {split!r}")
@@ -65,7 +67,21 @@ class SyntheticExpressionDataset(Dataset[dict[str, Any]]):
         self.metadata = self._load_metadata()
         self.gene_metadata = self._load_genes()
         self.section_ids_by_split = self._validate_split_definition()
-        self.section_ids = self.section_ids_by_split[split]
+        split_section_ids = self.section_ids_by_split[split]
+        if section_ids is None:
+            self.section_ids = split_section_ids
+        else:
+            requested = tuple(section_ids)
+            if not requested:
+                raise ValueError("section_ids must not be empty")
+            if len(requested) != len(set(requested)):
+                raise ValueError("section_ids must be unique")
+            unknown = sorted(set(requested) - set(split_section_ids))
+            if unknown:
+                raise ValueError(
+                    f"section_ids are outside the fixed {split!r} split: {unknown}"
+                )
+            self.section_ids = requested
         if not self.section_ids:
             raise ValueError(f"corpus split {split!r} contains no sections")
         self.cells_per_section = self._positive_metadata_int("cells_per_section")

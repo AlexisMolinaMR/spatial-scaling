@@ -2,9 +2,11 @@
 
 Empirical scaling laws for spatial transcriptomics models.
 
-Pilot v0's controlled synthetic spatial-context sweep and its low-K/
-distance-exclusion calibration are documented in
-`docs/context_scaling_v0.md` and `docs/spatial_scale_calibration_v0.md`.
+Pilot v0 is concluded and archived. Its final scientific and implementation
+status is recorded in [`docs/pilot_v0_closure.md`](docs/pilot_v0_closure.md).
+The detailed stage documents remain as reproducibility and historical-design
+records; the planned frozen-policy seven-point converged frontier was not
+completed or aggregated.
 
 Spatial representation learning is rapidly adopting larger datasets and increasingly complex architectures, but it is not yet clear what actually drives improvements in spatial biological models.
 
@@ -316,17 +318,11 @@ protocol are documented in
 
 ## Status
 
-Early research and infrastructure stage.
-
-Current priorities are:
-
-1. selecting the initial spatial datasets;
-2. defining canonical data units;
-3. choosing evaluation tasks;
-4. implementing baseline spatial representations;
-5. designing controlled scaling experiments.
-
-The repository intentionally does not yet commit to a single spatial architecture.
+**Pilot v0 is concluded and archived following a project-level research
+pivot.** Synthetic calibration, core spatial falsification, spatial-scale
+calibration, and data-scaling convergence-policy calibration were completed.
+The final converged full `N_train` sweep was not completed or aggregated. See the
+[`Pilot v0 closure record`](docs/pilot_v0_closure.md).
 
 ## Scientific philosophy
 
